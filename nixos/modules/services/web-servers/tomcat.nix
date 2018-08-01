@@ -156,6 +156,54 @@ in
         description = "List consisting of a virtual host name and a list of web applications to deploy on each virtual host";
       };
 
+      httpUsers = mkOption {
+        description = ''
+          Users for HTTP authentication.
+        '';
+        default = {};
+        example = literalExample ''
+          { admin = {
+              passwordFile = "/run/keys/tomcat-admin-password";
+              roles = [ "manager-gui" "namager-script" ];
+            };
+          }
+        '';
+        type = types.attrsOf (types.submodule {
+          options = {
+
+             password = mkOption {
+               type = types.nullOr types.str;
+               default = null;
+               description = ''
+                 The user's password. Warning: this is stored in cleartext in the Nix store!
+                 Use <option>passwordFile</option> instead.
+
+                 Either <option>password</option> or <option>passwordFile</option> must be specified.
+               '';
+             };
+
+             passwordFile = mkOption {
+               type = types.nullOr types.path;
+               default = null;
+               description = ''
+                 The file containing the user's password. Read during service startup.
+
+                 Either <option>password</option> or <option>passwordFile</option> must be specified.
+               '';
+             };
+
+             roles = mkOption {
+               type = types.listOf types.str;
+               default = [];
+               description = ''
+                 List of roles the user belongs to.
+               '';
+             };
+
+          };
+        });
+      };
+
       logPerVirtualHost = mkOption {
         type = types.bool;
         default = false;
@@ -192,7 +240,16 @@ in
 
   ###### implementation
 
-  config = mkIf config.services.tomcat.enable {
+  config = mkIf config.services.tomcat.enable (let
+    httpUserRoles = lib.unique (lib.concatLists (lib.mapAttrsToList (n: u: u.roles) cfg.httpUsers));
+    httpUsersWithLiteralPassword = lib.filterAttrs (n: u: u.password != null) cfg.httpUsers;
+    httpUsersWithFilePassword = lib.filterAttrs (n: u: u.passwordFile != null) cfg.httpUsers;
+  in {
+
+    assertions = lib.mapAttrsToList (n: u: {
+      assertion = (u.password != null) || (u.passwordFile != null);
+      message = "Either 'password' or 'passwordFile' must be defined in config.services.tomcat.${n}";
+    }) cfg.httpUsers;
 
     users.groups.tomcat.gid = config.ids.gids.tomcat;
 
@@ -209,6 +266,13 @@ in
       after = [ "network.target" ];
 
       preStart = ''
+        # Read HTTP user passwords before doing any changes
+        declare -A HTTP_PASSWORDS
+        ${toString (mapAttrsToList (n: u: ''
+                                            HTTP_PASSWORDS[${lib.escapeShellArg n}]=$(<${u.passwordFile})
+                                          '')
+                                   httpUsersWithFilePassword)}
+
         ${lib.optionalString cfg.purifyOnStart ''
           # Delete most directories/symlinks we create from the existing base directory,
           # to get rid of remainders of an old configuration.
@@ -227,8 +291,9 @@ in
         # Create a symlink to the bin directory of the tomcat component
         ln -sfn ${tomcat}/bin ${cfg.baseDir}/bin
 
-        # Symlink the config files in the conf/ directory (except for catalina.properties and server.xml)
-        for i in $(ls ${tomcat}/conf | grep -v catalina.properties | grep -v server.xml); do
+        # Symlink the config files in the conf/ directory (except for catalina.properties,
+        # server.xml, tomcat-users.xml)
+        for i in $(ls ${tomcat}/conf | egrep -v 'catalina.properties|server.xml|tomcat-users.xml'); do
           ln -sfn ${tomcat}/conf/$i ${cfg.baseDir}/conf/`basename $i`
         done
 
@@ -270,6 +335,15 @@ in
                   ${tomcat}/conf/server.xml > ${cfg.baseDir}/conf/server.xml
           ''
         }
+        # Create a modified tomcat-users.xml file
+        sed -e "/<\\/tomcat-users>/i\\  ${lib.concatStringsSep ''\\n  '' (
+                    map (r: ''<role rolename=\"${r}\" />'') httpUserRoles
+                    ++ mapAttrsToList (n: u: ''<user username=\"${n}\" password=\"${u.password}\" roles=\"${lib.concatStringsSep "," u.roles}\" />'')
+                                      httpUsersWithLiteralPassword
+                    ++ mapAttrsToList (n: u: ''<user username=\"${n}\" password=\"''${HTTP_PASSWORDS[${lib.escapeShellArg n}]}\" roles=\"${lib.concatStringsSep "," u.roles}\" />'')
+                                      httpUsersWithFilePassword
+               )}" \
+              ${tomcat}/conf/tomcat-users.xml > ${cfg.baseDir}/conf/tomcat-users.xml
         ${optionalString (cfg.logDirs != []) ''
           for i in ${toString cfg.logDirs}; do
             mkdir -p ${cfg.baseDir}/logs/$i
@@ -417,5 +491,5 @@ in
         ExecStop = "${tomcat}/bin/shutdown.sh";
       };
     };
-  };
+  });
 }
